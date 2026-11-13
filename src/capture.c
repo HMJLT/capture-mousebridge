@@ -181,6 +181,33 @@ static void copy_sample(IMFSample *sample) {
     buf->lpVtbl->Release(buf);
 }
 
+static void sync_current_media_type(IMFSourceReader *reader) {
+    IMFMediaType *mt = NULL;
+    if (!reader || FAILED(reader->lpVtbl->GetCurrentMediaType(
+            reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, &mt)) || !mt) return;
+
+    int w = g_fmt_w, h = g_fmt_h, stride = g_fmt_stride;
+    UINT64 size = 0;
+    if (SUCCEEDED(mt->lpVtbl->GetUINT64(mt, &MF_MT_FRAME_SIZE, &size))) {
+        UINT32 next_w = (UINT32)(size >> 32);
+        UINT32 next_h = (UINT32)(size & 0xFFFFFFFFu);
+        if (next_w && next_h) { w = (int)next_w; h = (int)next_h; }
+    }
+    UINT32 next_stride = 0;
+    if (SUCCEEDED(mt->lpVtbl->GetUINT32(mt, &MF_MT_DEFAULT_STRIDE, &next_stride)) && next_stride)
+        stride = (int)next_stride;
+    mt->lpVtbl->Release(mt);
+
+    ensure_lock();
+    EnterCriticalSection(&g_lock);
+    bool size_changed = w != g_fmt_w || h != g_fmt_h;
+    g_fmt_w = w;
+    g_fmt_h = h;
+    g_fmt_stride = stride;
+    if (size_changed && ensure_dibs(w, h)) g_front = -1;
+    LeaveCriticalSection(&g_lock);
+}
+
 static DWORD WINAPI capture_worker(LPVOID arg) {
     (void)arg;
     ensure_lock();
@@ -203,6 +230,16 @@ static DWORD WINAPI capture_worker(LPVOID arg) {
         if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
             if (g_running) set_error("采集源已结束：设备可能被拔出", "采集源结束, 已停止预览");
             break;
+        }
+        if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
+            sync_current_media_type(g_reader);
+            if (sample) { sample->lpVtbl->Release(sample); sample = NULL; }
+            gui_request_repaint();
+            continue;
+        }
+        if (flags & MF_SOURCE_READERF_STREAMTICK) {
+            if (sample) { sample->lpVtbl->Release(sample); sample = NULL; }
+            continue;
         }
         if (!sample) {
             if (g_state.cap_frames == frames_at_start && now_sec() - t_start > 5.0) {
@@ -564,3 +601,5 @@ bool capture_save_bmp(const char *path) {
     LeaveCriticalSection(&g_lock);
     return ok;
 }
+
+

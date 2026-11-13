@@ -100,6 +100,7 @@ typedef struct {
 } ui_t;
 
 static ui_t g_ui;
+static RECT g_video_layout = {0, 0, 0, 0};
 
 static int S(int px) { return MulDiv(px, g_dpi, 96); }
 
@@ -688,7 +689,11 @@ static void layout(HWND hwnd) {
     vi.left = g_ui.videoCard.left + S(10);
     vi.right = g_ui.videoCard.right - S(10);
     vi.bottom = g_ui.videoCard.bottom - S(10);
-    MoveWindow(g_video, vi.left, vi.top, rw(vi), rh(vi), TRUE);
+    if (!EqualRect(&g_video_layout, &vi)) {
+        MoveWindow(g_video, vi.left, vi.top, rw(vi), rh(vi), FALSE);
+        g_video_layout = vi;
+        InvalidateRect(g_video, NULL, TRUE);
+    }
 
     /* 端口输入框 / UDP 的 IP 与端口输入框 */
     if (g_ui.editPort.left > 0) {
@@ -922,9 +927,19 @@ LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT rc;
             GetClientRect(hwnd, &rc);
 
-            /* 直接画到窗口 DC, 少一次整幅 BitBlt (1080p60 下省得可观) */
-            fill_rect(dc, rc, RGB(0, 0, 0));
-            if (!capture_blit(dc, &rc)) video_hint(dc, rc);
+            /* 先在内存 DC 完整绘制，再一次提交，避免 StretchDIBits 中间态闪烁。 */
+            HDC mem = CreateCompatibleDC(dc);
+            HBITMAP bmp = mem ? CreateCompatibleBitmap(dc, rc.right, rc.bottom) : NULL;
+            HGDIOBJ old = bmp ? SelectObject(mem, bmp) : NULL;
+            HDC target = bmp ? mem : dc;
+            fill_rect(target, rc, RGB(0, 0, 0));
+            if (!capture_blit(target, &rc)) video_hint(target, rc);
+            if (bmp) {
+                BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+                SelectObject(mem, old);
+                DeleteObject(bmp);
+            }
+            DeleteDC(mem);
 
             EndPaint(hwnd, &ps);
             return 0;
