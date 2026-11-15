@@ -223,9 +223,10 @@ P,ping              心跳, 固件回 P,pong
 
 启动流程：
 
-1. 若 NVS 中存在 STA 凭据，固件尝试连接保存的 Wi-Fi；连接失败或没有凭据时自动创建 `AI-KVM-<MAC后6位>` 热点。
-2. 热点密码默认是 `RM-KVM-<MAC后6位>`，首次连接后可通过串口配置为自定义 SSID/密码。
-3. STA/AP 两种模式都提供 `ai-kvm.local`（若网络支持 mDNS）、UDP 4210 和 HTTP 80 的 `/api/status`。
+1. 若 NVS 中存在 STA 凭据，固件尝试连接保存的 Wi-Fi；连接失败时保持 STA 离线，不自动切换网络。
+2. 如果没有保存凭据，固件启动 AP 作为首次配网入口；已连接 STA 时可在状态页右上角点击“使用 AP 模式”。
+3. 热点密码默认是 `RM-KVM-<MAC后6位>`，可通过串口配置为自定义 SSID/密码。
+4. STA/AP 两种模式都提供 `ai-kvm.local`（若网络支持 mDNS）、UDP 4210 和 HTTP 80 的 `/api/status`。
 
 串口配置命令：
 

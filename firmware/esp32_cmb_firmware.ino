@@ -326,7 +326,14 @@ static void cmbStartStationOrAp() {
     g_ap_mode = false; WiFi.mode(WIFI_STA); WiFi.begin(g_sta_ssid.c_str(), g_sta_password.c_str());
     uint32_t deadline = millis() + 8000;
     while (WiFi.status() != WL_CONNECTED && millis() < deadline) delay(100);
-    if (WiFi.status() != WL_CONNECTED) { cmbStartAp(); return; }
+    if (WiFi.status() != WL_CONNECTED) {
+        // An explicit STA choice must not silently switch networks. The user
+        // can select AP mode from the status page or use WIFI,AP over serial.
+        g_wifi_ready = false;
+        WiFi.disconnect(false, false);
+        Serial.println(F("WIFI,STA,offline; select AP mode from the web page or serial"));
+        return;
+    }
     g_wifi_ready = true; cmbStartMdns();
 }
 
@@ -382,11 +389,21 @@ static void cmbHandleHttp() {
         if (request.endsWith("\r\n\r\n")) break;
         if (request.length() > 512) break;
     }
+    if (request.startsWith("GET /api/wifi?mode=ap")) {
+        g_prefs.putString("mode", "ap");
+        client.print(F("HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":true,\"restarting\":true,\"mode\":\"ap\"}"));
+        client.flush(); delay(100); client.stop(); ESP.restart(); return;
+    }
+    if (request.startsWith("GET /api/wifi?mode=sta")) {
+        g_prefs.putString("mode", "auto");
+        client.print(F("HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":true,\"restarting\":true,\"mode\":\"sta\"}"));
+        client.flush(); delay(100); client.stop(); ESP.restart(); return;
+    }
     if (request.startsWith("GET /api/status")) {
         client.print(F("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"));
         client.print(cmbStatusJson());
     } else {
-        client.print(F("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n<!doctype html><meta charset=utf-8><title>AI-KVM ESP32</title><style>body{font:16px system-ui;max-width:720px;margin:40px auto;padding:0 20px;background:#101722;color:#e8eef5}pre{padding:16px;border-radius:12px;background:#1c2735}</style><h1>AI-KVM ESP32</h1><pre id=s>loading</pre><script>fetch('/api/status').then(r=>r.json()).then(x=>s.textContent=JSON.stringify(x,null,2))</script>"));
+        client.print(F("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n<!doctype html><meta charset=utf-8><title>AI-KVM ESP32</title><style>body{font:16px system-ui;max-width:760px;margin:40px auto;padding:0 20px;background:#101722;color:#e8eef5}header{display:flex;justify-content:space-between;align-items:center;gap:16px}button{border:0;border-radius:10px;padding:10px 14px;background:#2878e8;color:#fff;font-weight:700;cursor:pointer}pre{padding:16px;border-radius:12px;background:#1c2735;overflow:auto}</style><header><h1>AI-KVM ESP32</h1><button id=b>选择 AP 模式</button></header><p>网络模式由此页面明确选择，STA 失败不会自动切换。</p><pre id=s>loading</pre><script>fetch('/api/status').then(r=>r.json()).then(x=>{s.textContent=JSON.stringify(x,null,2);b.textContent=x.mode==='ap'?'切回 STA 模式':'使用 AP 模式';b.onclick=()=>{b.disabled=true;b.textContent='重启中…';fetch('/api/wifi?mode='+(x.mode==='ap'?'sta':'ap'))}})</script>"));
     }
     client.stop();
 }
