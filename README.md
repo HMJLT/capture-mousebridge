@@ -238,7 +238,7 @@ WIFI,OFF
 
 Arduino IDE 选择 ESP32-S2/S3，并启用 USB-OTG/HID。烧录后可直接打开热点地址的 `http://<板子IP>/` 查看状态；桌面端 UDP 通道会自动通过 mDNS、广播和网段发现连接。
 
-协议字段、MCP 工具、热点状态和故障恢复步骤见 [MCP 接口说明](docs/MCP.md)、[ESP32 Wi-Fi 指南](docs/ESP32-WIFI.md) 和 [Wiki 首页](docs/wiki/Home.md)。
+协议字段、MCP 工具、热点状态和故障恢复步骤见 [MCP 接口说明](docs/MCP.md)、[ESP32 Wi-Fi 指南](docs/ESP32-WIFI.md)、[仓库 Wiki](https://github.com/HMJLT/capture-mousebridge/wiki) 和 [本地 Wiki 源文档](docs/wiki/Home.md)。
 
 ## 已知限制
 
