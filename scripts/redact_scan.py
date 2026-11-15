@@ -23,6 +23,10 @@ def scan(root: Path, public: bool) -> list[str]:
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
+        if any(part in {".git", "__pycache__", ".pytest_cache", "build"} for part in path.parts):
+            continue
+        if path.suffix.lower() in {".pyc", ".pyo"}:
+            continue
         if path.name in {".gitignore"}:
             continue
         if path.name == "redact_scan.py":

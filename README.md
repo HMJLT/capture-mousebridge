@@ -1,5 +1,9 @@
 # CaptureMouseBridge（采集卡桥）
 
+[![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![ESP32](https://img.shields.io/badge/firmware-ESP32--S2%2FS3-blue.svg)](firmware/esp32_cmb_firmware.ino)
+[![MCP](https://img.shields.io/badge/MCP-JSON--RPC-orange.svg)](docs/MCP.md)
+
 采集卡画面实时预览 + 键鼠透传（类虚拟机映射）+ ESP32 断线重连向导 + 内置 MCP 的纯 C / MSVC 原生桌面程序，编译为单个 `CaptureMouseBridge.exe`（无 Python、无浏览器面板、默认不占端口）。
 
 - **原生 GUI**：Win32 自绘窗口（Unicode / 深色卡片式），支持最小化到系统托盘。
@@ -52,7 +56,7 @@ capture-mousebridge/
 
 ## 编译
 
-环境：MSVC 14.51（VS18）Hostx64\x64 + Windows SDK 10.0.26100。
+环境：Visual Studio（安装 Desktop development with C++ 和 Windows 10/11 SDK）。`build.bat` 通过 `vswhere` 自动寻找 MSVC，不绑定某台机器的安装路径。
 
 ```
 build.bat
@@ -213,15 +217,28 @@ K,up,code,mods      键盘松开
 P,ping              心跳, 固件回 P,pong
 ```
 
-## ESP32 固件
+## ESP32 固件与热点
 
-**UDP 通道不需要我们这份固件**——用你桌面上那套 `AI-KVM 控制台` 已经烧进板子的固件即可（它自带 `ai-kvm.local` mDNS、UDP 4210、16 字节协议与状态回包）。本程序只负责按同一协议发包与控制。
+`firmware/esp32_cmb_firmware.ino` 现在是完整的公开固件：串口行协议、USB HID、Wi-Fi STA、自动 AP fallback、mDNS、UDP 4210 和 HTTP 状态页在同一份 sketch 中实现。上位机不再依赖私有厂商固件。
 
-`firmware/esp32_cmb_firmware.ino` 是**串口行协议**的示例固件（没有 Wi-Fi/UDP 部分），只在你要自己做一块「纯 USB 串口 HID 小板」时才用。固件维护完整的 6 键 HID 报告，串口空闲 2 秒会自动释放所有键和鼠标按钮，避免上位机异常退出后留下按键卡住：
+启动流程：
 
-1. Arduino IDE 安装对应板卡支持包。
-2. 打开 `.ino`，选板子与 USB 口烧录；板卡配置里 USB Mode 设为 HID/OTG。
-3. 固件解析 `M,/K,/P` 行协议并通过 USB HID 上报鼠标/键盘；收到 `P,ping` 回 `P,pong`。
+1. 若 NVS 中存在 STA 凭据，固件尝试连接保存的 Wi-Fi；连接失败或没有凭据时自动创建 `AI-KVM-<MAC后6位>` 热点。
+2. 热点密码默认是 `RM-KVM-<MAC后6位>`，首次连接后可通过串口配置为自定义 SSID/密码。
+3. STA/AP 两种模式都提供 `ai-kvm.local`（若网络支持 mDNS）、UDP 4210 和 HTTP 80 的 `/api/status`。
+
+串口配置命令：
+
+```text
+WIFI,STA,<ssid>,<password>
+WIFI,AP,<ssid>,<password>
+WIFI,STATUS
+WIFI,OFF
+```
+
+Arduino IDE 选择 ESP32-S2/S3，并启用 USB-OTG/HID。烧录后可直接打开热点地址的 `http://<板子IP>/` 查看状态；桌面端 UDP 通道会自动通过 mDNS、广播和网段发现连接。
+
+协议字段、MCP 工具、热点状态和故障恢复步骤见 [MCP 接口说明](docs/MCP.md)、[ESP32 Wi-Fi 指南](docs/ESP32-WIFI.md) 和 [Wiki 首页](docs/wiki/Home.md)。
 
 ## 已知限制
 

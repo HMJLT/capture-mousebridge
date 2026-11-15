@@ -1,0 +1,29 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  public-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Run public redaction scan
+        run: python scripts/redact_scan.py . --public
+      - name: Run protocol tests
+        run: python -m unittest discover -s tests -p 'test_*.py'
+
+  native-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CaptureMouseBridge
+        shell: cmd
+        run: build.bat

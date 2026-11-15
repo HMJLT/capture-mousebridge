@@ -16,8 +16,22 @@
 
 #include <Arduino.h>
 #include <HID.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Preferences.h>
+#include <ESPmDNS.h>
 #include <stdlib.h>
 #include <string.h>
+
+static constexpr uint16_t CMB_UDP_PORT = 4210;
+static constexpr uint16_t CMB_HTTP_PORT = 80;
+static constexpr uint8_t CMB_DEV_KEYBOARD = 0x01;
+static constexpr uint8_t CMB_DEV_MOUSE = 0x02;
+static constexpr uint8_t CMB_DEV_CONTROL = 0x03;
+static constexpr uint8_t CMB_CTRL_PING = 0x01;
+static constexpr uint8_t CMB_CTRL_SET_INTERVAL = 0x04;
+static constexpr uint8_t CMB_CTRL_RELEASE = 0x05;
+static constexpr uint8_t CMB_CTRL_STATUS = 0x06;
 
 // Windows VK 常量 (与 WinUser.h 对齐, 避免依赖 Windows 头)
 #define VK_RETURN   0x0D
@@ -137,6 +151,22 @@ static unsigned long g_last_input_ms = 0;
 static const unsigned long INPUT_TIMEOUT_MS = 2000;
 static bool g_rx_overflow = false;
 
+// Wi-Fi/AP state is persisted in ESP32 NVS. No credentials are compiled in.
+static Preferences g_prefs;
+static WiFiUDP g_udp;
+static WiFiServer g_http(CMB_HTTP_PORT);
+static bool g_wifi_ready = false;
+static bool g_ap_mode = false;
+static String g_sta_ssid;
+static String g_sta_password;
+static String g_ap_ssid;
+static String g_ap_password;
+static uint32_t g_rx_count = 0;
+static uint32_t g_udp_rx_count = 0;
+static uint16_t g_last_sequence = 0;
+static bool g_have_sequence = false;
+static uint16_t g_pace_ms = 4;
+
 static void releaseAll() {
     g_key_mods = 0;
     g_key_count = 0;
@@ -248,8 +278,135 @@ void handleKey(char *tok, bool down) {
     hid.keyReport(g_key_mods, g_keys, g_key_count);
 }
 
+static String cmbIpText(const IPAddress &ip) { return ip.toString(); }
+
+static String cmbMacSuffix() {
+    String mac = WiFi.macAddress();
+    mac.replace(":", "");
+    return mac.length() > 6 ? mac.substring(mac.length() - 6) : mac;
+}
+
+static String cmbStatusJson() {
+    IPAddress ip = g_ap_mode ? WiFi.softAPIP() : WiFi.localIP();
+    String out = F("{\"ok\":true,\"mode\":\"");
+    out += g_ap_mode ? F("ap") : F("sta");
+    out += F("\",\"ssid\":\""); out += g_ap_mode ? g_ap_ssid : g_sta_ssid;
+    out += F("\",\"ip\":\""); out += cmbIpText(ip);
+    out += F("\",\"mdns\":\"ai-kvm.local\",\"udp_port\":4210,\"http_port\":80");
+    out += F(",\"rx\":"); out += String(g_rx_count);
+    out += F(",\"udp_rx\":"); out += String(g_udp_rx_count);
+    out += F(",\"last_sequence\":"); out += String(g_last_sequence);
+    out += F(",\"pace_ms\":"); out += String(g_pace_ms);
+    out += F(",\"hid_mounted\":true}");
+    return out;
+}
+
+static void cmbStartMdns() {
+    MDNS.end();
+    if (MDNS.begin("ai-kvm")) MDNS.addService("kvm", "udp", CMB_UDP_PORT);
+}
+
+static void cmbStartAp() {
+    g_ap_mode = true; g_wifi_ready = false;
+    if (g_ap_ssid.isEmpty()) g_ap_ssid = String(F("AI-KVM-")) + cmbMacSuffix();
+    if (g_ap_password.length() < 8) g_ap_password = String(F("RM-KVM-")) + cmbMacSuffix();
+    WiFi.disconnect(true, false); WiFi.mode(WIFI_AP);
+    g_wifi_ready = WiFi.softAP(g_ap_ssid.c_str(), g_ap_password.c_str());
+    if (g_wifi_ready) cmbStartMdns();
+}
+
+static void cmbStartStationOrAp() {
+    String mode = g_prefs.getString("mode", "auto");
+    g_sta_ssid = g_prefs.getString("ssid", "");
+    g_sta_password = g_prefs.getString("password", "");
+    g_ap_ssid = g_prefs.getString("ap_ssid", "");
+    g_ap_password = g_prefs.getString("ap_password", "");
+    if (mode == "off") { WiFi.mode(WIFI_OFF); g_wifi_ready = false; return; }
+    if (mode == "ap" || g_sta_ssid.isEmpty()) { cmbStartAp(); return; }
+    g_ap_mode = false; WiFi.mode(WIFI_STA); WiFi.begin(g_sta_ssid.c_str(), g_sta_password.c_str());
+    uint32_t deadline = millis() + 8000;
+    while (WiFi.status() != WL_CONNECTED && millis() < deadline) delay(100);
+    if (WiFi.status() != WL_CONNECTED) { cmbStartAp(); return; }
+    g_wifi_ready = true; cmbStartMdns();
+}
+
+static void cmbRestartNetwork(const String &mode, const String &ssid, const String &password) {
+    g_prefs.putString("mode", mode); g_prefs.putString("ssid", ssid); g_prefs.putString("password", password);
+    delay(40); ESP.restart();
+}
+
+static bool cmbAcceptSequence(uint16_t sequence) {
+    if (sequence == 0) return true;
+    if (g_have_sequence && sequence == g_last_sequence) return false;
+    g_last_sequence = sequence; g_have_sequence = true; return true;
+}
+
+static int16_t cmbReadI16(const uint8_t *p) { return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
+
+static void cmbUdpText(IPAddress remote, uint16_t port, const String &text) {
+    g_udp.beginPacket(remote, port); g_udp.print(text); g_udp.endPacket();
+}
+
+static void cmbHandleUdp() {
+    int length = g_udp.parsePacket();
+    if (length <= 0) return;
+    uint8_t packet[64] = {0};
+    length = g_udp.read(packet, sizeof(packet));
+    if (length != 16) return;
+    uint16_t sequence = (uint16_t)packet[14] | ((uint16_t)packet[15] << 8);
+    if (!cmbAcceptSequence(sequence)) return;
+    ++g_udp_rx_count; ++g_rx_count; touchInput();
+    if (packet[0] == CMB_DEV_MOUSE) {
+        hid.mouseMove((int8_t)constrain(cmbReadI16(packet + 8), -127, 127),
+                      (int8_t)constrain(cmbReadI16(packet + 10), -127, 127), packet[12] & 0x07, (int8_t)packet[13]);
+    } else if (packet[0] == CMB_DEV_KEYBOARD) {
+        g_key_mods = packet[1]; g_key_count = 0;
+        for (uint8_t i = 0; i < 6 && packet[2 + i] != 0; ++i) g_keys[g_key_count++] = packet[2 + i];
+        hid.keyReport(g_key_mods, g_keys, g_key_count);
+    } else if (packet[0] == CMB_DEV_CONTROL) {
+        uint8_t command = packet[1];
+        uint16_t argument = (uint16_t)packet[2] | ((uint16_t)packet[3] << 8);
+        if (command == CMB_CTRL_RELEASE) releaseAll();
+        else if (command == CMB_CTRL_SET_INTERVAL) g_pace_ms = constrain(argument, 2, 200);
+        cmbUdpText(g_udp.remoteIP(), g_udp.remotePort(), cmbStatusJson());
+    }
+}
+
+static void cmbHandleHttp() {
+    WiFiClient client = g_http.available();
+    if (!client) return;
+    uint32_t deadline = millis() + 500; String request;
+    while (client.connected() && millis() < deadline) {
+        if (!client.available()) { delay(1); continue; }
+        request += (char)client.read();
+        if (request.endsWith("\r\n\r\n")) break;
+        if (request.length() > 512) break;
+    }
+    if (request.startsWith("GET /api/status")) {
+        client.print(F("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"));
+        client.print(cmbStatusJson());
+    } else {
+        client.print(F("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n<!doctype html><meta charset=utf-8><title>AI-KVM ESP32</title><style>body{font:16px system-ui;max-width:720px;margin:40px auto;padding:0 20px;background:#101722;color:#e8eef5}pre{padding:16px;border-radius:12px;background:#1c2735}</style><h1>AI-KVM ESP32</h1><pre id=s>loading</pre><script>fetch('/api/status').then(r=>r.json()).then(x=>s.textContent=JSON.stringify(x,null,2))</script>"));
+    }
+    client.stop();
+}
+
 void processLine(String line) {
+    line.trim();
     if (line.length() == 0) return;
+    ++g_rx_count;
+    if (line.startsWith("WIFI,STATUS")) { Serial.println(cmbStatusJson()); return; }
+    if (line.startsWith("WIFI,OFF")) { g_prefs.putString("mode", "off"); WiFi.disconnect(true, true); g_wifi_ready = false; Serial.println(cmbStatusJson()); return; }
+    if (line.startsWith("WIFI,AP,")) {
+        int split = line.indexOf(',', 8);
+        if (split > 8) { g_ap_ssid = line.substring(8, split); g_ap_password = line.substring(split + 1); g_prefs.putString("ap_ssid", g_ap_ssid); g_prefs.putString("ap_password", g_ap_password); g_prefs.putString("mode", "ap"); delay(40); ESP.restart(); }
+        return;
+    }
+    if (line.startsWith("WIFI,STA,")) {
+        int split = line.indexOf(',', 9);
+        if (split > 9) cmbRestartNetwork("auto", line.substring(9, split), line.substring(split + 1));
+        return;
+    }
     char buf[128]; line.toCharArray(buf, sizeof(buf));
     char *p = buf;
 
@@ -277,6 +434,11 @@ void setup() {
     // 部分平台需注册描述符: HID_.setReportDesc(...) 视框架而定
     rxLine.reserve(64);
     g_last_input_ms = millis();
+    g_prefs.begin("cmb", false);
+    cmbStartStationOrAp();
+    g_udp.begin(CMB_UDP_PORT);
+    g_http.begin();
+    Serial.println(cmbStatusJson());
 }
 
 void loop() {
@@ -292,6 +454,10 @@ void loop() {
                 else g_rx_overflow = true;
             }
         }
+    }
+    if (g_wifi_ready) {
+        cmbHandleUdp();
+        cmbHandleHttp();
     }
     if (g_input_active && millis() - g_last_input_ms > INPUT_TIMEOUT_MS)
         releaseAll();
